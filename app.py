@@ -36,17 +36,54 @@ def load_master(path="cyclone_dashboard_master_data.csv"):
 
 def prepare(df):
     df = df.copy()
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+
+    required = ["Time", "Wind_Speed", "Pressure", "Rainfall", "PM25", "AOD", "Cyclone"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError("CSV missing required columns: " + ", ".join(missing))
+
     df["Time"] = pd.to_datetime(df["Time"], errors="coerce")
+    df = df.dropna(subset=["Time", "Cyclone", "PM25"]).copy()
+    df = df.sort_values(["Cyclone", "Time"]).reset_index(drop=True)
+
+    df["Hour"] = df["Time"].dt.hour
+    df["DayOfYear"] = df["Time"].dt.dayofyear
+    df["Hour_Sin"] = np.sin(2 * np.pi * df["Hour"] / 24)
+    df["Hour_Cos"] = np.cos(2 * np.pi * df["Hour"] / 24)
+
+    for lag in (1, 2, 3):
+        col = f"PM25_Lag{lag}"
+        calculated = df.groupby("Cyclone")["PM25"].shift(lag)
+        if col not in df.columns:
+            df[col] = calculated
+        else:
+            df[col] = df[col].fillna(calculated)
+
+    if "Cyclone_Phase" not in df.columns:
+        df["Cyclone_Phase"] = "Phase 2"
+    df["Cyclone_Phase"] = df["Cyclone_Phase"].fillna("Phase 2").astype(str)
+
+    phase_cols = ["Phase_Phase 1", "Phase_Phase 2", "Phase_Phase 3"]
+    df = df.drop(columns=phase_cols, errors="ignore")
     dummies = pd.get_dummies(df["Cyclone_Phase"], prefix="Phase")
-    for c in ["Phase_Phase 1", "Phase_Phase 2", "Phase_Phase 3"]:
-        if c not in dummies:
-            dummies[c] = 0
-    df = pd.concat([df.reset_index(drop=True),
-                    dummies[["Phase_Phase 1","Phase_Phase 2","Phase_Phase 3"]].reset_index(drop=True)], axis=1)
-    for c in MODEL_FEATURES + ["PM25_Next_Hour"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.sort_values(["Cyclone","Time"]).reset_index(drop=True)
+    for col in phase_cols:
+        if col not in dummies.columns:
+            dummies[col] = 0
+
+    df = pd.concat(
+        [df.reset_index(drop=True), dummies[phase_cols].reset_index(drop=True)],
+        axis=1
+    )
+
+    for col in MODEL_FEATURES + ["PM25_Next_Hour"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "PM25_Next_Hour" not in df.columns:
+        df["PM25_Next_Hour"] = df.groupby("Cyclone")["PM25"].shift(-1)
+
+    return df.sort_values(["Cyclone", "Time"]).reset_index(drop=True)
 
 def cpcb_category(x):
     if x <= 30: return "Good"
@@ -60,8 +97,7 @@ def cpcb_category(x):
 def run_forecast(master, selected_cyclone, current_time, event_data=None):
     master = prepare(master)
 
-    # Train on the other historical cyclones for known events.
-    # For a new cyclone, train on all historical cyclones.
+    # Hold out the selected historical cyclone when it exists in training data.
     selected_in_master = (
         master["Cyclone"].astype(str) == str(selected_cyclone)
     ).any()
@@ -73,50 +109,46 @@ def run_forecast(master, selected_cyclone, current_time, event_data=None):
     else:
         train = master.copy()
 
-    train = train.dropna(
-        subset=MODEL_FEATURES + ["PM25_Next_Hour"]
-    )
+    train = train.dropna(subset=MODEL_FEATURES + ["PM25_Next_Hour"])
+    if train.empty:
+        raise ValueError("No valid historical training rows are available.")
 
-    # Use uploaded event data when provided.
     source = event_data.copy() if event_data is not None else master[
         master["Cyclone"].astype(str) == str(selected_cyclone)
     ].copy()
 
     source = prepare(source)
-    source["Time"] = pd.to_datetime(source["Time"], errors="coerce")
-    row = source[source["Time"] == pd.Timestamp(current_time)]
+    source = source[
+        source["Cyclone"].astype(str) == str(selected_cyclone)
+    ].copy()
 
-    if row.empty:
-        raise ValueError("Selected observation time was not found in the uploaded data.")
-
-    current = row.iloc[-1].copy()
-
-    # Build lag features from observations available up to current_time.
-    history = source[source["Time"] <= pd.Timestamp(current_time)].sort_values("Time")
+    timestamp = pd.Timestamp(current_time)
+    history = source[source["Time"] <= timestamp].sort_values("Time")
     history = history.drop_duplicates(subset=["Time"], keep="last")
 
+    matching = history[history["Time"] == timestamp]
+    if matching.empty:
+        raise ValueError("Selected time was not found in the cyclone data.")
     if len(history) < 4:
-        raise ValueError(
-            "At least 4 hourly observations are needed to construct PM2.5 lag features."
-        )
+        raise ValueError("At least 4 observations are needed to calculate PM2.5 lags.")
+
+    current = matching.iloc[-1].copy()
 
     for lag in (1, 2, 3):
         current[f"PM25_Lag{lag}"] = float(history.iloc[-(lag + 1)]["PM25"])
 
-    timestamp = pd.Timestamp(current_time)
     current["Hour"] = timestamp.hour
     current["DayOfYear"] = timestamp.dayofyear
     current["Hour_Sin"] = np.sin(2 * np.pi * timestamp.hour / 24)
     current["Hour_Cos"] = np.cos(2 * np.pi * timestamp.hour / 24)
 
-    # Preserve the phase supplied by the data, if available.
     phase = str(current.get("Cyclone_Phase", "Phase 2"))
-    for p in ["Phase 1", "Phase 2", "Phase 3"]:
-        current[f"Phase_{p}"] = int(phase == p)
+    for label in ["Phase 1", "Phase 2", "Phase 3"]:
+        current[f"Phase_{label}"] = int(phase == label)
 
     missing = [
         feature for feature in MODEL_FEATURES
-        if pd.isna(current.get(feature, np.nan))
+        if feature not in current.index or pd.isna(current[feature])
     ]
     if missing:
         raise ValueError("Missing model inputs: " + ", ".join(missing))
@@ -127,16 +159,16 @@ def run_forecast(master, selected_cyclone, current_time, event_data=None):
     model.fit(train[MODEL_FEATURES], train["PM25_Next_Hour"])
 
     X = pd.DataFrame(
-        [[current[f] for f in MODEL_FEATURES]],
+        [[current[feature] for feature in MODEL_FEATURES]],
         columns=MODEL_FEATURES
     )
-    pred = max(0.0, float(model.predict(X)[0]))
+    prediction = max(0.0, float(model.predict(X)[0]))
 
-    # Actual next-hour value is only available for historical data.
-    actual = current.get("PM25_Next_Hour", None)
-    actual = None if actual is None or pd.isna(actual) else float(actual)
+    actual_value = current.get("PM25_Next_Hour", None)
+    actual = None if actual_value is None or pd.isna(actual_value) else float(actual_value)
 
-    return current, pred, actual, model, train
+    return current, prediction, actual, model, train
+
 
 st.title("🌪️ Cyclone-Aware PM2.5 Forecasting Dashboard")
 st.caption("Leakage-safe next-hour forecasting using the project's Phase 37 Random Forest workflow.")
@@ -179,13 +211,18 @@ if event_rows.empty:
     st.error("No rows found for the selected cyclone.")
     st.stop()
 
-valid_times = event_rows.dropna(subset=MODEL_FEATURES)["Time"].sort_values()
+valid_times = event_rows.dropna(subset=["Time", "PM25"])["Time"].sort_values()
 current_time = st.selectbox("Select current observation time", list(valid_times), format_func=lambda x: pd.Timestamp(x).strftime("%Y-%m-%d %H:%M"))
 
 if st.button("🚀 RUN NEXT-HOUR FORECAST", type="primary", use_container_width=True):
     try:
         # Use master data for the LOCO training population.
-        current, pred, actual, model, train = run_forecast(master, selected, current_time)
+        current, pred, actual, model, train = run_forecast(
+            master,
+            selected,
+            current_time,
+            event_data=working if uploaded is not None else None
+        )
     except Exception as e:
         st.error(str(e))
         st.stop()
