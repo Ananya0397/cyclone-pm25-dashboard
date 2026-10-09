@@ -141,7 +141,7 @@ def run_forecast(master, selected_cyclone, current_time, event_data=None):
 st.title("🌪️ Cyclone-Aware PM2.5 Forecasting Dashboard")
 st.caption("Leakage-safe next-hour forecasting using the project's Phase 37 Random Forest workflow.")
 
-if not Path("cyclone_dashboard_master_data.csv").exists():
+if not __import__("os").path.exists("cyclone_dashboard_master_data.csv"):
     st.error("Place cyclone_dashboard_master_data.csv in the same folder as app.py.")
     st.stop()
 
