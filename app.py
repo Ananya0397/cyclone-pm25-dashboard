@@ -172,7 +172,7 @@ def train_model(master):
 
 
 st.title("🌪️ Cyclone-Aware PM2.5 Forecasting Dashboard")
-st.caption("Train on the historical cyclone dataset, upload a partial new-cyclone CSV, and forecast PM2.5 for the next hour.")
+st.caption("Leakage-aware next-hour PM2.5 forecasting using the project’s historical cyclone data and Random Forest workflow.")
 
 with st.sidebar:
     st.header("1. Historical training data")
@@ -247,13 +247,12 @@ st.success(f"Forecast generated for **{forecast_time:%d %b %Y, %H:%M}** using ob
 if len(event) < 4:
     st.warning("Fewer than four observations were uploaded. Lag values may be missing or insufficient for a reliable forecast.")
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Latest observed PM2.5", f"{float(current['PM25']):.2f} µg/m³")
-c2.metric("Predicted next-hour PM2.5", f"{prediction:.2f} µg/m³")
-c3.metric("Forecast timestamp", forecast_time.strftime("%d-%m %H:%M"))
-c4.metric("CPCB category", cpcb_category(prediction))
-if actual is not None:
-    st.metric("Actual next-hour PM2.5 (provided in file)", f"{actual:.2f} µg/m³", delta=f"Absolute error: {absolute_error:.2f} µg/m³")
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Current PM2.5", f"{float(current['PM25']):.2f} µg/m³")
+c2.metric("Predicted Next Hour", f"{prediction:.2f} µg/m³")
+c3.metric("Historical Actual", "N/A" if actual is None else f"{actual:.2f} µg/m³")
+c4.metric("Absolute Error", "N/A" if absolute_error is None else f"{absolute_error:.2f} µg/m³")
+c5.metric("CPCB Category", cpcb_category(prediction))
 
 st.caption(f"Training used {training['Cyclone'].nunique()} cyclone(s) and {len(training):,} complete rows from the historical dataset. The uploaded new cyclone is forecast using only its latest observed row.")
 
@@ -274,6 +273,10 @@ with right:
         fig2.add_trace(go.Scatter(x=series["Time"], y=series["Value"], mode="lines", name=name))
     fig2.update_layout(height=420, xaxis_title="Time", yaxis_title="Value (original units)", hovermode="x unified")
     st.plotly_chart(fig2, use_container_width=True)
+
+st.subheader("Cyclone Phase")
+phase_counts = event["Cyclone_Phase"].value_counts().reindex(["Phase 1", "Phase 2", "Phase 3"]).fillna(0)
+st.bar_chart(phase_counts)
 
 st.subheader("Uploaded cyclone observations")
 st.dataframe(event[["Time", "PM25", "AOD", "Wind_Speed", "Pressure", "Rainfall", "Cyclone_Phase"]].tail(20), use_container_width=True)
